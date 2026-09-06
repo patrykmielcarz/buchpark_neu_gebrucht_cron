@@ -102,6 +102,11 @@ FALLBACK_PER_SIDE = 5      # so viele Einzel-Exemplare je Seite speichern
 SCAN_PAGES = 3             # Listing-Seiten à 100, die durchsucht werden
 SIBLING_BATCH = 10         # parentIds pro Geschwister-Request
 
+# Ein PATCH auf eine Kategorie invalidiert Caches und kann deutlich länger
+# dauern als ein Lesezugriff — mit 30 s lief der erste Live-Lauf in einen
+# ReadTimeout, obwohl der Shop den Schreibvorgang danach ausgeführt hatte.
+ADMIN_TIMEOUT = 120
+
 PRODUCT_INCLUDES = {
     "product": ["id", "parentId", "name", "translated", "cover",
                 "calculatedPrice", "options", "categoryIds"],
@@ -347,28 +352,97 @@ def collect_singles(category_id: str, option_id: str, want_grade: str,
 # Schritt 3: Schreiben
 # ──────────────────────────────────────────────────────────────────────
 
-def write_category(token: str, category_id: str, payload: dict) -> None:
+def read_custom_fields(token: str, category_id: str) -> dict:
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    r = session.get(f"{SHOP_URL}/api/category/{category_id}", headers=headers,
+                    timeout=ADMIN_TIMEOUT)
+    r.raise_for_status()
+    attributes = (r.json().get("data") or {}).get("attributes") or {}
+    return dict(attributes.get("customFields") or {})
+
+
+def previous_payload(custom_fields: dict) -> dict:
+    raw = custom_fields.get(CUSTOM_FIELD)
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw) if isinstance(raw, str) else dict(raw)
+    except (ValueError, TypeError):
+        return {}
+
+
+def merge_with_previous(new: dict, previous: dict) -> dict:
+    """
+    Leere Listen NICHT übernehmen, sondern den letzten Stand behalten.
+
+    Findet ein Lauf z. B. für Musik kein einziges Paar mehr (die Auswahl ist
+    dort ohnehin dünn), soll die Kachel weiter die Titel der Vorwoche zeigen,
+    statt in den Fallback-Modus zu fallen. Verkaufte Exemplare sind dabei
+    unkritisch: das Widget validiert jeden Kandidaten beim Rendern erneut
+    und geht selbstständig zum nächsten weiter.
+    """
+    merged = dict(new)
+    carried = []
+    for key in ("pairs", "fallbackNeu", "fallbackUsed"):
+        if not merged.get(key) and previous.get(key):
+            merged[key] = previous[key]
+            carried.append(key)
+    if carried:
+        merged["carriedOver"] = carried
+        merged["previousUpdate"] = previous.get("updated")
+        log(f"  ~ übernommen aus dem letzten Lauf: {', '.join(carried)}")
+    return merged
+
+
+def write_category(token: str, category_id: str, payload: dict, tries: int = 3) -> None:
     """
     Custom Field der Kategorie aktualisieren.
 
     Erst lesen, dann mergen, dann schreiben — damit andere Felder
     (z. B. buchpark_category_product_count_ aus dem Zähler-Cron)
     unangetastet bleiben.
+
+    Ein Timeout heißt hier NICHT, dass nichts passiert ist: beim ersten
+    Live-Lauf lief der PATCH für DVD & Blu-ray in einen ReadTimeout,
+    der Wert stand danach trotzdem in der Kategorie. Deshalb wird nach
+    einem Timeout erst gegengelesen und nur dann erneut geschrieben,
+    wenn der Wert wirklich fehlt.
     """
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    r = session.get(f"{SHOP_URL}/api/category/{category_id}", headers=headers, timeout=30)
-    r.raise_for_status()
-    existing = (r.json().get("data") or {}).get("attributes") or {}
-    custom_fields = dict(existing.get("customFields") or {})
-    custom_fields[CUSTOM_FIELD] = json.dumps(payload, ensure_ascii=False)
+    serialized = None
 
-    r = session.patch(
-        f"{SHOP_URL}/api/category/{category_id}",
-        headers=headers,
-        json={"customFields": custom_fields},
-        timeout=30,
-    )
-    r.raise_for_status()
+    for attempt in range(1, tries + 1):
+        custom_fields = read_custom_fields(token, category_id)
+        if serialized is None:
+            serialized = json.dumps(
+                merge_with_previous(payload, previous_payload(custom_fields)),
+                ensure_ascii=False,
+            )
+        if custom_fields.get(CUSTOM_FIELD) == serialized:
+            return                                    # steht schon drin
+        custom_fields[CUSTOM_FIELD] = serialized
+        try:
+            r = session.patch(
+                f"{SHOP_URL}/api/category/{category_id}",
+                headers=headers,
+                json={"customFields": custom_fields},
+                timeout=ADMIN_TIMEOUT,
+            )
+            r.raise_for_status()
+            return
+        except requests.exceptions.ReadTimeout:
+            log("  ! PATCH-Timeout — prüfe, ob der Wert trotzdem ankam")
+            time.sleep(5)
+            if read_custom_fields(token, category_id).get(CUSTOM_FIELD) == serialized:
+                log("  -> Wert ist gesetzt, Timeout war nur die Antwort")
+                return
+            if attempt == tries:
+                raise
+        except Exception as exc:                      # noqa: BLE001
+            if attempt == tries:
+                raise
+            log(f"  ! Schreiben fehlgeschlagen ({exc}), neuer Versuch")
+            time.sleep(5 * attempt)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -425,11 +499,21 @@ def main() -> int:
         return 1
 
     token = admin_token()
+    failed = []
     for key, entry in results.items():
-        write_category(token, entry["categoryId"], entry["payload"])
-        log(f"\n{key}: geschrieben "
-            f"({len(entry['payload']['pairs'])} Paare, "
-            f"{len(entry['payload']['fallbackNeu'])}/{len(entry['payload']['fallbackUsed'])} Fallback)")
+        # Eine hakende Kategorie darf die anderen nicht mitreißen
+        try:
+            write_category(token, entry["categoryId"], entry["payload"])
+            log(f"\n{key}: geschrieben "
+                f"({len(entry['payload']['pairs'])} Paare, "
+                f"{len(entry['payload']['fallbackNeu'])}/{len(entry['payload']['fallbackUsed'])} Fallback)")
+        except Exception as exc:                      # noqa: BLE001
+            failed.append(key)
+            log(f"\n{key}: FEHLER beim Schreiben — {exc}")
+
+    if failed:
+        log(f"\nNicht geschrieben: {', '.join(failed)} (alter Stand bleibt stehen)")
+        return 1
     return 0
 
 
