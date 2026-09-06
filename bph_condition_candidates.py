@@ -109,7 +109,7 @@ ADMIN_TIMEOUT = 120
 
 PRODUCT_INCLUDES = {
     "product": ["id", "parentId", "name", "translated", "cover",
-                "calculatedPrice", "options", "categoryIds"],
+                "calculatedPrice", "options", "categoryIds", "customFields"],
     "property_group_option": ["name", "group"],
     "property_group": ["name"],
     "media": ["url", "metaData"],
@@ -201,13 +201,35 @@ def is_excluded(p: dict) -> bool:
     return False
 
 
-def usable(p: dict) -> bool:
-    return (
+def media_family(p: dict) -> Optional[str]:
+    """
+    Tatsächliches Medium laut Custom Fields — NICHT laut Kategorie.
+
+    Im Katalog liegen Bücher in Musik und DVD & Blu-ray: unter den
+    DVD-Kandidaten des ersten Laufs waren 2 von 2 in Wahrheit Bücher
+    (u. a. „Hiroshima Capriccios" von Leopold Federmair), bei Musik
+    1 von 4. Ohne diese Prüfung stünde in der DVD-Kachel „Buch | Deutsch".
+    """
+    cf = p.get("customFields") or {}
+    if cf.get("book_details_media_type"):
+        return "buch"
+    if cf.get("music_details_media_type"):
+        return "musik"
+    if cf.get("film_details_media_type") or cf.get("movie_details_format"):
+        return "film"
+    return None
+
+
+def usable(p: dict, category_key: Optional[str] = None) -> bool:
+    if not (
         product_price(p) >= MIN_PRICE
         and condition(p) is not None
         and has_real_cover(p)
         and not is_excluded(p)
-    )
+    ):
+        return False
+    # ohne Medien-Metadaten kein Kandidat — sonst raten wir
+    return media_family(p) == category_key if category_key else True
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -261,12 +283,12 @@ def fetch_siblings(parent_ids: List[str]) -> Dict[str, List[dict]]:
     return by_parent
 
 
-def evaluate_pair(children: List[dict]) -> Optional[dict]:
+def evaluate_pair(children: List[dict], category_key: str) -> Optional[dict]:
     """Bestes Neu/Gebraucht-Paar eines Titels — oder None, wenn es keins gibt."""
     new_copy = None
     used_copy = None
     for child in children:
-        if not usable(child):
+        if not usable(child, category_key):
             continue
         grade = condition(child)
         price = product_price(child)
@@ -298,14 +320,15 @@ def evaluate_pair(children: List[dict]) -> Optional[dict]:
         "used": used_price,
         "grade": condition(used_copy),
         "save": save,
+        "family": media_family(new_copy),
     }
 
 
-def collect_pairs(category_id: str) -> List[dict]:
+def collect_pairs(category_id: str, category_key: str) -> List[dict]:
     parents = scan_parent_ids(category_id)
     log(f"  {len(parents)} Titel mit Neu-Exemplar gefunden")
     by_parent = fetch_siblings(parents)
-    pairs = [p for p in (evaluate_pair(kids) for kids in by_parent.values()) if p]
+    pairs = [p for p in (evaluate_pair(kids, category_key) for kids in by_parent.values()) if p]
     pairs.sort(key=lambda x: x["save"], reverse=True)
     return pairs[:PAIRS_PER_CATEGORY]
 
@@ -314,8 +337,8 @@ def collect_pairs(category_id: str) -> List[dict]:
 # Schritt 2: Fallback-Einzelprodukte
 # ──────────────────────────────────────────────────────────────────────
 
-def collect_singles(category_id: str, option_id: str, want_grade: str,
-                    order: Optional[str]) -> List[dict]:
+def collect_singles(category_id: str, category_key: str, option_id: str,
+                    want_grade: str, order: Optional[str]) -> List[dict]:
     """
     Einzelne Exemplare eines Zustands.
 
@@ -342,7 +365,7 @@ def collect_singles(category_id: str, option_id: str, want_grade: str,
         for el in data.get("elements") or []:
             if len(out) >= FALLBACK_PER_SIDE:
                 break
-            if condition(el) != want_grade or not usable(el):
+            if condition(el) != want_grade or not usable(el, category_key):
                 continue
             out.append({"id": el["id"], "name": product_name(el), "price": product_price(el)})
     return out
@@ -462,13 +485,14 @@ def main() -> int:
         log(f"\n=== {key} ===")
         started = time.time()
 
-        pairs = collect_pairs(category_id)
+        pairs = collect_pairs(category_id, key)
         log(f"  {len(pairs)} gültige Paare")
         for p in pairs:
-            log(f"    {p['name'][:44]} | Neu {p['neu']:.2f} -> {p['grade']} {p['used']:.2f} (-{p['save']}%)")
+            log(f"    [{p['family']}] {p['name'][:40]} | "
+                f"Neu {p['neu']:.2f} -> {p['grade']} {p['used']:.2f} (-{p['save']}%)")
 
-        fb_new = collect_singles(category_id, OPTION_NEU, "Neu", None)
-        fb_used = collect_singles(category_id, OPTION_SEHR_GUT, "Sehr gut", "price-asc")
+        fb_new = collect_singles(category_id, key, OPTION_NEU, "Neu", None)
+        fb_used = collect_singles(category_id, key, OPTION_SEHR_GUT, "Sehr gut", "price-asc")
         log(f"  Fallback: {len(fb_new)} neu / {len(fb_used)} gebraucht")
 
         results[key] = {
