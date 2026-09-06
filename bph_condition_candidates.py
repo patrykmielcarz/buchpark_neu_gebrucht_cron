@@ -68,6 +68,11 @@ STORE_KEY = os.environ.get("SW_STORE_API_KEY", "")
 ADMIN_ID = os.environ.get("SW_ADMIN_CLIENT_ID", "")
 ADMIN_SECRET = os.environ.get("SW_ADMIN_CLIENT_SECRET", "")
 DRY_RUN = os.environ.get("BPH_DRY_RUN") == "1"
+# Einmal-Schalter: alte Listen NICHT übernehmen. Nötig, wenn sich die
+# Filterregeln geändert haben und im Feld noch Kandidaten stehen, die
+# nach neuer Regel gar keine mehr wären (z. B. Bücher in der
+# DVD-Kategorie, bevor die Medienart-Prüfung dazukam).
+NO_CARRY = os.environ.get("BPH_NO_CARRY") == "1"
 
 CUSTOM_FIELD = "buchpark_condition_candidates"
 
@@ -405,6 +410,8 @@ def merge_with_previous(new: dict, previous: dict) -> dict:
     und geht selbstständig zum nächsten weiter.
     """
     merged = dict(new)
+    if NO_CARRY:
+        return merged
     carried = []
     for key in ("pairs", "fallbackNeu", "fallbackUsed"):
         if not merged.get(key) and previous.get(key):
