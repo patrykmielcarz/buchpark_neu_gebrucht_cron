@@ -415,17 +415,36 @@ def collect_singles(category_id: str, option_id: str,
     return out
 
 
-def category_href(category_id: str) -> Optional[str]:
-    """SEO-Pfad der Kategorie für den „Alle … ansehen"-Link (optional)."""
+def category_href(token: str, category_id: str) -> Optional[str]:
+    """
+    SEO-Pfad der Kategorie fuer den „Alle … ansehen"-Link.
+
+    Ueber die Admin API, nicht ueber die Store API: der Versuch, seoUrls
+    an /store-api/category mitzuladen, lieferte im Testlauf durchgehend
+    null. Der Link ist Kuer — schlaegt es fehl, rendert das Widget die
+    Kachel einfach ohne Fusszeile.
+    """
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     try:
-        data = store_post(f"/category/{category_id}",
-                          {"includes": {"category": ["id", "seoUrls"]},
-                           "associations": {"seoUrls": {}}})
-        urls = data.get("seoUrls") or []
-        path = urls[0].get("seoPathInfo") if urls else None
+        r = session.post(
+            f"{SHOP_URL}/api/search/seo-url",
+            headers=headers,
+            json={
+                "limit": 1,
+                "filter": [
+                    {"type": "equals", "field": "foreignKey", "value": category_id},
+                    {"type": "equals", "field": "routeName", "value": "frontend.navigation.page"},
+                    {"type": "equals", "field": "isCanonical", "value": True},
+                ],
+            },
+            timeout=ADMIN_TIMEOUT,
+        )
+        r.raise_for_status()
+        rows = r.json().get("data") or []
+        path = (rows[0].get("attributes") or {}).get("seoPathInfo") if rows else None
         return "/" + path if path else None
     except Exception:                                  # noqa: BLE001
-        return None       # Link ist Kür — das Widget rendert die Kachel auch ohne
+        return None
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -563,6 +582,11 @@ def main() -> int:
 
     tiles: List[dict] = []
     picked: List[Tuple[str, str]] = []
+    # Produkte haengen in mehreren Kategorien: im Testlauf tauchte
+    # „365 Kreuzwortraetsel" sowohl unter Business & Karriere als auch
+    # unter Geschenkbuecher auf. Ohne diese Sperre stuende derselbe Titel
+    # in zwei Kacheln nebeneinander.
+    seen_products: set = set()
     draws = 0
 
     while len(tiles) < TILE_COUNT and draws < MAX_DRAWS:
@@ -585,20 +609,27 @@ def main() -> int:
         log(f"  Fallback: {len(fb_new)} neu / {len(fb_used)} gebraucht")
         log(f"  {time.time() - started:.1f}s")
 
-        # Eine Kachel muss entweder ein Paar oder ein vollständiges
-        # Fallback-Duo tragen — sonst bliebe sie im Widget leer.
-        if not pairs and not (fb_new and fb_used):
+        # Dubletten gegen die bereits vergebenen Kacheln herausnehmen …
+        pair_ids = [p["parentId"] for p in pairs if p["parentId"] not in seen_products]
+        neu_ids = [p["id"] for p in fb_new if p["id"] not in seen_products]
+        used_ids = [p["id"] for p in fb_used if p["id"] not in seen_products]
+
+        # … und erst danach pruefen: eine Kachel muss entweder ein Paar
+        # oder ein vollstaendiges Fallback-Duo tragen, sonst bliebe sie
+        # im Widget leer.
+        if not pair_ids and not (neu_ids and used_ids):
             log("  -> keine verwertbaren Kandidaten, nächste Kategorie")
             continue
 
+        seen_products.update(pair_ids + neu_ids + used_ids)
         picked.append(entry)
         tiles.append({
             "categoryId": category_id,
             "label": label,
-            "href": category_href(category_id),
-            "pairs": [p["parentId"] for p in pairs],
-            "fallbackNeu": [p["id"] for p in fb_new],
-            "fallbackUsed": [p["id"] for p in fb_used],
+            "href": category_href(token, category_id),
+            "pairs": pair_ids,
+            "fallbackNeu": neu_ids,
+            "fallbackUsed": used_ids,
         })
 
     tiles = fill_up_from_previous(tiles, previous)
