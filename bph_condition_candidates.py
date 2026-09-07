@@ -5,37 +5,56 @@ bph_condition_candidates.py
 
 Wöchentlicher Cron für die /start-Sektion „Neu oder gebraucht" (bph-cond).
 
+NUR BÜCHER
+----------
+Die Sektion zeigt drei Kacheln, und alle drei sind Bücher-Unterkategorien.
+Musik und DVD & Blu-ray sind bewusst raus.
+
+Rotation
+--------
+Jede Woche werden drei Unterkategorien gezogen — zufällig, aber ohne
+Wiederholung: bereits gezeigte Kategorien werden übersprungen, bis der
+Pool leer ist. Läuft er MITTEN in einer Ziehung leer, beginnt ein neuer
+Zyklus, wobei die in dieser Runde schon gezogenen Kategorien ausgenommen
+bleiben — sonst stünde dieselbe Kategorie zweimal nebeneinander.
+
+Der Rotationsstand steht im selben Custom Field wie die Kacheln
+(Schlüssel "used"). Ein eigener Speicher ist damit unnötig, und ein
+fehlgeschlagener Lauf „verbraucht" keine Kategorie: geschrieben wird
+erst, wenn Kandidaten wirklich gefunden wurden.
+
 Was der Job tut
 ---------------
-1. Sucht je Hauptkategorie Titel, die es NEU und GEBRAUCHT gibt
+1. Zieht drei Bücher-Unterkategorien (siehe oben).
+2. Sucht je Kategorie Titel, die es NEU und GEBRAUCHT gibt
    (Paar-Kandidaten, identifiziert über die parentId).
-2. Sucht zusätzlich einzelne neue und einzelne (günstige) gebrauchte
+3. Sucht zusätzlich einzelne neue und einzelne (günstige) gebrauchte
    Exemplare als Fallback, falls kein Paar mehr gültig ist.
-3. Validiert beides und schreibt das Ergebnis in das Custom Field
-   `buchpark_condition_candidates` der jeweiligen Hauptkategorie.
+4. Schreibt alles zusammen in EIN Custom Field
+   `buchpark_condition_candidates` an der Kategorie „Bücher".
+   Das Widget liest genau dieses Feld und rendert, was drinsteht —
+   es kennt die Kategorien nicht mehr selbst.
 
 Warum überhaupt ein Cron
 ------------------------
 Das Suchen ist langsam: der Listing-Request mit Property-Filter „Neu"
-braucht live gemessen 6,2 s (Bücher, auch bei Wiederholung 3,5 s),
-1,7 s (Musik), 0,6 s (Film). Das Auslesen der Geschwister zu bekannten
-parentIds dagegen nur ~200 ms. Deshalb: Suche einmal pro Woche hier,
-Preise live im Widget.
+brauchte live gemessen mehrere Sekunden. Das Auslesen der Geschwister zu
+bekannten parentIds dagegen nur ~200 ms. Deshalb: Suche einmal pro Woche
+hier, Preise live im Widget.
 
 Warum Store API zum Lesen
 -------------------------
 Der Property-Filter („nur Artikelzustand = Neu") existiert so nur am
 Listing-Endpoint der Store API. Ein Filter auf optionIds am normalen
-/product-Endpoint lief in der Messung ins Timeout (>45 s), ein Filter
-auf `ean` brauchte 44 s für eine einzige EAN. Geschrieben wird über die
-Admin API, weil Custom Fields nur dort schreibbar sind.
+/product-Endpoint lief in der Messung ins Timeout (>45 s). Geschrieben
+wird über die Admin API, weil Custom Fields nur dort schreibbar sind.
 
 Bekannte Datenfallen (alle unten im Code behandelt)
 ---------------------------------------------------
+* In den Bücher-Kategorien liegen auch Nicht-Bücher. Maßgeblich ist
+  nicht die Kategorie, sondern book_details_media_type am Produkt.
 * Manche Kind-Exemplare tragen ZWEI Artikelzustand-Optionen gleichzeitig
   (z. B. „Neu" + „Wie neu"). Sie sind nicht eindeutig -> überspringen.
-  Betrifft vor allem Musik und ist auch der Grund, warum der
-  Artikelzustand-Filter im Shop dort unzuverlässig ist.
 * Preise sind nicht immer monoton über die Zustände (Akzeptabel teurer
   als Gut). Nur absteigende Paare kommen durch.
 * Frisch importierte Artikel tragen ein generiertes Platzhalter-Cover
@@ -49,13 +68,15 @@ SW_STORE_API_KEY       sw-access-key des Verkaufskanals (lesen)
 SW_ADMIN_CLIENT_ID     Integration aus dem Admin (schreiben)
 SW_ADMIN_CLIENT_SECRET
 BPH_DRY_RUN            "1" = nur ausgeben, nichts schreiben
+BPH_RESET_ROTATION     "1" = Rotationsstand verwerfen und neu beginnen
 """
 
 import json
 import os
+import random
 import sys
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import requests
 
@@ -68,19 +89,47 @@ STORE_KEY = os.environ.get("SW_STORE_API_KEY", "")
 ADMIN_ID = os.environ.get("SW_ADMIN_CLIENT_ID", "")
 ADMIN_SECRET = os.environ.get("SW_ADMIN_CLIENT_SECRET", "")
 DRY_RUN = os.environ.get("BPH_DRY_RUN") == "1"
-# Einmal-Schalter: alte Listen NICHT übernehmen. Nötig, wenn sich die
-# Filterregeln geändert haben und im Feld noch Kandidaten stehen, die
-# nach neuer Regel gar keine mehr wären (z. B. Bücher in der
-# DVD-Kategorie, bevor die Medienart-Prüfung dazukam).
-NO_CARRY = os.environ.get("BPH_NO_CARRY") == "1"
+RESET_ROTATION = os.environ.get("BPH_RESET_ROTATION") == "1"
 
 CUSTOM_FIELD = "buchpark_condition_candidates"
 
-CATEGORIES = {
-    "buch":  "5ad62c021e3ff311321a1c5b357e43dd",   # Bücher
-    "musik": "547da3f90ec7bf92c7dd96d16c80ca01",   # Musik-CDs & Vinyl
-    "film":  "6b9248b51d9f829b12533046ac8fdc91",   # DVD & Blu-ray
-}
+# Trägerkategorie: hier stehen Kacheln UND Rotationsstand.
+CONFIG_CATEGORY_ID = "5ad62c021e3ff311321a1c5b357e43dd"   # Bücher
+
+TILE_COUNT = 3
+
+# Pool der Bücher-Unterkategorien: (categoryId, Anzeigename).
+# Schule & Lernen, Kalender und Erotik sind bewusst nicht dabei — sie
+# stehen ohnehin in EXCLUDE_CATEGORY_IDS.
+CATEGORY_POOL: List[Tuple[str, str]] = [
+    ("19c8b5436914ace027d19139f048d0e7", "Biografien & Erinnerungen"),
+    ("544d3a4f60daf8282a00b16d7d64eab9", "Börse & Geld"),
+    ("c4a2f5742a5b8d1c0bf9b730abd85831", "Business & Karriere"),
+    ("a7f588b600962e7f0748ddb12a0b0aa2", "Comics & Mangas"),
+    ("b31d85348e8d3850ed8d950b387edac2", "Computer & Internet"),
+    ("e54dc19adfe2255cee1898676f0a999c", "Esoterik"),
+    ("144982acbefab767d0b862eb2080f53d", "Fachbücher"),
+    ("7bd2727970f3145d4f8ee23b6a55afbd", "Fantasy & Science Fiction"),
+    ("29ef598fe119dd4f77401634ae3bbb51", "Film, Kunst & Kultur"),
+    ("427b9567dd2219535348abfb4f112c1f", "Freizeit, Haus & Garten"),
+    ("43fad17d2032f59a9fe40bedfc699591", "Geschenkbücher"),
+    ("725b0927d9d616a362fc4b957e2ce1ab", "Jugendbücher"),
+    ("b310f92273f5f3d46600bf0336eeddef", "Kinderbücher"),
+    ("513f6114563ce94e1417f4a60397ccb0", "Kochen & Genießen"),
+    ("5c38a83946937ad372eb51c1bdf684d7", "Krimis & Thriller"),
+    ("8b4a15ca29c724ab3b80dac21d21a133", "LGBTQ+"),
+    ("4652e4aa57836e42dbea13c404002941", "Liebesromane"),
+    ("06cb4b87054afa0b3fc7b1817f81ed45", "Literatur & Fiktion"),
+    ("1b1e265a25d71f126ea13e9f236d022d", "Medizin"),
+    ("b5c43b3d6aadf01b2b113065e279ab34", "Naturwissenschaften & Technik"),
+    ("379e443421f0e4f069225dbdafdc4839", "Politik & Geschichte"),
+    ("13887e0cafdf2e1240191c2f3d6b863c", "Ratgeber"),
+    ("4bf23d0a436024d1273bcc0a1c263523", "Recht"),
+    ("2e93d15da06a595e2715b8e1ed59f3ab", "Reise & Abenteuer"),
+    ("1fbaf5f60dcdab6b6fc0ecef6d253dba", "Religion & Glaube"),
+    ("e59ba735f508f65a13df1badf00e6f31", "Sozialwissenschaft"),
+    ("4f4a852fa4098ea8b37118c6dbd3cad1", "Sport & Fitness"),
+]
 
 # property_group_option-IDs der Gruppe „Artikelzustand"
 OPTION_NEU = "01952253885d72fbbde5dbdaff169068"
@@ -102,10 +151,11 @@ EXCLUDE_TITLE_WORDS = [
 
 MIN_SAVE_PCT = 30          # Mindestersparnis im Paar-Modus
 MIN_PRICE = 1.0            # Cent-Artikel raus
-PAIRS_PER_CATEGORY = 8     # so viele Paar-Kandidaten pro Kategorie speichern
+PAIRS_PER_CATEGORY = 8     # so viele Paar-Kandidaten pro Kachel speichern
 FALLBACK_PER_SIDE = 5      # so viele Einzel-Exemplare je Seite speichern
 SCAN_PAGES = 3             # Listing-Seiten à 100, die durchsucht werden
 SIBLING_BATCH = 10         # parentIds pro Geschwister-Request
+MAX_DRAWS = 8              # Reißleine: so viele Kategorien maximal probieren
 
 # Ein PATCH auf eine Kategorie invalidiert Caches und kann deutlich länger
 # dauern als ein Lesezugriff — mit 30 s lief der erste Live-Lauf in einen
@@ -128,6 +178,10 @@ PRODUCT_INCLUDES = {
 # ──────────────────────────────────────────────────────────────────────
 
 session = requests.Session()
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
 
 
 def store_post(path: str, payload: dict, tries: int = 3) -> dict:
@@ -158,10 +212,6 @@ def admin_token() -> str:
     )
     r.raise_for_status()
     return r.json()["access_token"]
-
-
-def log(msg: str) -> None:
-    print(msg, flush=True)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -206,35 +256,25 @@ def is_excluded(p: dict) -> bool:
     return False
 
 
-def media_family(p: dict) -> Optional[str]:
+def is_book(p: dict) -> bool:
     """
     Tatsächliches Medium laut Custom Fields — NICHT laut Kategorie.
 
-    Im Katalog liegen Bücher in Musik und DVD & Blu-ray: unter den
-    DVD-Kandidaten des ersten Laufs waren 2 von 2 in Wahrheit Bücher
-    (u. a. „Hiroshima Capriccios" von Leopold Federmair), bei Musik
-    1 von 4. Ohne diese Prüfung stünde in der DVD-Kachel „Buch | Deutsch".
+    Im Katalog liegen Bücher in Musik und DVD & Blu-ray und umgekehrt.
+    Seit die Sektion nur noch Bücher zeigt, ist das ein reines
+    Ausschlusskriterium: ohne book_details_* kein Kandidat.
     """
-    cf = p.get("customFields") or {}
-    if cf.get("book_details_media_type"):
-        return "buch"
-    if cf.get("music_details_media_type"):
-        return "musik"
-    if cf.get("film_details_media_type") or cf.get("movie_details_format"):
-        return "film"
-    return None
+    return bool((p.get("customFields") or {}).get("book_details_media_type"))
 
 
-def usable(p: dict, category_key: Optional[str] = None) -> bool:
-    if not (
+def usable(p: dict) -> bool:
+    return (
         product_price(p) >= MIN_PRICE
         and condition(p) is not None
         and has_real_cover(p)
         and not is_excluded(p)
-    ):
-        return False
-    # ohne Medien-Metadaten kein Kandidat — sonst raten wir
-    return media_family(p) == category_key if category_key else True
+        and is_book(p)
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -288,12 +328,12 @@ def fetch_siblings(parent_ids: List[str]) -> Dict[str, List[dict]]:
     return by_parent
 
 
-def evaluate_pair(children: List[dict], category_key: str) -> Optional[dict]:
+def evaluate_pair(children: List[dict]) -> Optional[dict]:
     """Bestes Neu/Gebraucht-Paar eines Titels — oder None, wenn es keins gibt."""
     new_copy = None
     used_copy = None
     for child in children:
-        if not usable(child, category_key):
+        if not usable(child):
             continue
         grade = condition(child)
         price = product_price(child)
@@ -325,15 +365,14 @@ def evaluate_pair(children: List[dict], category_key: str) -> Optional[dict]:
         "used": used_price,
         "grade": condition(used_copy),
         "save": save,
-        "family": media_family(new_copy),
     }
 
 
-def collect_pairs(category_id: str, category_key: str) -> List[dict]:
+def collect_pairs(category_id: str) -> List[dict]:
     parents = scan_parent_ids(category_id)
     log(f"  {len(parents)} Titel mit Neu-Exemplar gefunden")
     by_parent = fetch_siblings(parents)
-    pairs = [p for p in (evaluate_pair(kids, category_key) for kids in by_parent.values()) if p]
+    pairs = [p for p in (evaluate_pair(kids) for kids in by_parent.values()) if p]
     pairs.sort(key=lambda x: x["save"], reverse=True)
     return pairs[:PAIRS_PER_CATEGORY]
 
@@ -342,14 +381,14 @@ def collect_pairs(category_id: str, category_key: str) -> List[dict]:
 # Schritt 2: Fallback-Einzelprodukte
 # ──────────────────────────────────────────────────────────────────────
 
-def collect_singles(category_id: str, category_key: str, option_id: str,
+def collect_singles(category_id: str, option_id: str,
                     want_grade: str, order: Optional[str]) -> List[dict]:
     """
     Einzelne Exemplare eines Zustands.
 
     Gebrauchte werden nach Preis aufsteigend geholt: die erste Listing-Seite
-    lieferte sonst teure Vinyl-Pressungen (22–28 €), gegen die jedes neue
-    Exemplar günstig aussah — genau umgekehrt zur Aussage der Sektion.
+    lieferte sonst teure Exemplare, gegen die jedes neue günstig aussah —
+    genau umgekehrt zur Aussage der Sektion.
     """
     out: List[dict] = []
     for page in range(1, SCAN_PAGES + 1):
@@ -370,10 +409,45 @@ def collect_singles(category_id: str, category_key: str, option_id: str,
         for el in data.get("elements") or []:
             if len(out) >= FALLBACK_PER_SIDE:
                 break
-            if condition(el) != want_grade or not usable(el, category_key):
+            if condition(el) != want_grade or not usable(el):
                 continue
             out.append({"id": el["id"], "name": product_name(el), "price": product_price(el)})
     return out
+
+
+def category_href(category_id: str) -> Optional[str]:
+    """SEO-Pfad der Kategorie für den „Alle … ansehen"-Link (optional)."""
+    try:
+        data = store_post(f"/category/{category_id}",
+                          {"includes": {"category": ["id", "seoUrls"]},
+                           "associations": {"seoUrls": {}}})
+        urls = data.get("seoUrls") or []
+        path = urls[0].get("seoPathInfo") if urls else None
+        return "/" + path if path else None
+    except Exception:                                  # noqa: BLE001
+        return None       # Link ist Kür — das Widget rendert die Kachel auch ohne
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Rotation
+# ──────────────────────────────────────────────────────────────────────
+
+def pick_next(available: List[Tuple[str, str]],
+              picked: List[Tuple[str, str]]) -> Optional[Tuple[str, str]]:
+    """
+    Nächste Kategorie ziehen. Ist der Pool leer, beginnt ein neuer Zyklus —
+    ohne die in dieser Runde bereits gezogenen Kategorien, damit keine
+    Kachel doppelt erscheint.
+    """
+    if not available:
+        chosen = {c[0] for c in picked}
+        available.extend(c for c in CATEGORY_POOL if c[0] not in chosen)
+        log("  ~ Pool erschöpft — neuer Zyklus (laufende Auswahl bleibt ausgenommen)")
+    if not available:
+        return None
+    entry = random.choice(available)
+    available.remove(entry)
+    return entry
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -399,32 +473,29 @@ def previous_payload(custom_fields: dict) -> dict:
         return {}
 
 
-def merge_with_previous(new: dict, previous: dict) -> dict:
+def fill_up_from_previous(tiles: List[dict], previous: dict) -> List[dict]:
     """
-    Leere Listen NICHT übernehmen, sondern den letzten Stand behalten.
-
-    Findet ein Lauf z. B. für Musik kein einziges Paar mehr (die Auswahl ist
-    dort ohnehin dünn), soll die Kachel weiter die Titel der Vorwoche zeigen,
-    statt in den Fallback-Modus zu fallen. Verkaufte Exemplare sind dabei
-    unkritisch: das Widget validiert jeden Kandidaten beim Rendern erneut
-    und geht selbstständig zum nächsten weiter.
+    Kamen weniger als TILE_COUNT Kacheln zusammen, werden Kacheln des
+    letzten Laufs aufgefüllt — aber nur solche, deren Kategorie diesmal
+    nicht ohnehin schon dabei ist. Lieber eine Kachel der Vorwoche als
+    eine Lücke im Dreier-Grid.
     """
-    merged = dict(new)
-    if NO_CARRY:
-        return merged
-    carried = []
-    for key in ("pairs", "fallbackNeu", "fallbackUsed"):
-        if not merged.get(key) and previous.get(key):
-            merged[key] = previous[key]
-            carried.append(key)
-    if carried:
-        merged["carriedOver"] = carried
-        merged["previousUpdate"] = previous.get("updated")
-        log(f"  ~ übernommen aus dem letzten Lauf: {', '.join(carried)}")
-    return merged
+    if len(tiles) >= TILE_COUNT:
+        return tiles[:TILE_COUNT]
+    have = {t.get("categoryId") for t in tiles}
+    for old in previous.get("tiles") or []:
+        if len(tiles) >= TILE_COUNT:
+            break
+        if old.get("categoryId") in have:
+            continue
+        old = dict(old)
+        old["carriedOver"] = True
+        tiles.append(old)
+        log(f"  ~ Kachel aus dem letzten Lauf übernommen: {old.get('label')}")
+    return tiles
 
 
-def write_category(token: str, category_id: str, payload: dict, tries: int = 3) -> None:
+def write_category(token: str, category_id: str, serialized: str, tries: int = 3) -> None:
     """
     Custom Field der Kategorie aktualisieren.
 
@@ -433,21 +504,14 @@ def write_category(token: str, category_id: str, payload: dict, tries: int = 3) 
     unangetastet bleiben.
 
     Ein Timeout heißt hier NICHT, dass nichts passiert ist: beim ersten
-    Live-Lauf lief der PATCH für DVD & Blu-ray in einen ReadTimeout,
-    der Wert stand danach trotzdem in der Kategorie. Deshalb wird nach
-    einem Timeout erst gegengelesen und nur dann erneut geschrieben,
-    wenn der Wert wirklich fehlt.
+    Live-Lauf lief ein PATCH in einen ReadTimeout, der Wert stand danach
+    trotzdem in der Kategorie. Deshalb wird nach einem Timeout erst
+    gegengelesen und nur dann erneut geschrieben, wenn der Wert fehlt.
     """
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    serialized = None
 
     for attempt in range(1, tries + 1):
         custom_fields = read_custom_fields(token, category_id)
-        if serialized is None:
-            serialized = json.dumps(
-                merge_with_previous(payload, previous_payload(custom_fields)),
-                ensure_ascii=False,
-            )
         if custom_fields.get(CUSTOM_FIELD) == serialized:
             return                                    # steht schon drin
         custom_fields[CUSTOM_FIELD] = serialized
@@ -483,68 +547,89 @@ def main() -> int:
     if not STORE_KEY:
         log("SW_STORE_API_KEY fehlt — Abbruch.")
         return 1
-    if not DRY_RUN and not (ADMIN_ID and ADMIN_SECRET):
-        log("Admin-Zugangsdaten fehlen — Abbruch (oder BPH_DRY_RUN=1 setzen).")
-        return 1
-
-    results = {}
-    for key, category_id in CATEGORIES.items():
-        log(f"\n=== {key} ===")
-        started = time.time()
-
-        pairs = collect_pairs(category_id, key)
-        log(f"  {len(pairs)} gültige Paare")
-        for p in pairs:
-            log(f"    [{p['family']}] {p['name'][:40]} | "
-                f"Neu {p['neu']:.2f} -> {p['grade']} {p['used']:.2f} (-{p['save']}%)")
-
-        fb_new = collect_singles(category_id, key, OPTION_NEU, "Neu", None)
-        fb_used = collect_singles(category_id, key, OPTION_SEHR_GUT, "Sehr gut", "price-asc")
-        log(f"  Fallback: {len(fb_new)} neu / {len(fb_used)} gebraucht")
-
-        results[key] = {
-            "payload": {
-                "updated": time.strftime("%Y-%m-%d"),
-                "pairs": [p["parentId"] for p in pairs],
-                "fallbackNeu": [p["id"] for p in fb_new],
-                "fallbackUsed": [p["id"] for p in fb_used],
-            },
-            "categoryId": category_id,
-        }
-        log(f"  {time.time() - started:.1f}s")
-
-    # Sicherung: keine Kategorie leer schreiben — lieber alten Stand behalten
-    empty = [k for k, v in results.items()
-             if not v["payload"]["pairs"] and not (v["payload"]["fallbackNeu"] and v["payload"]["fallbackUsed"])]
-    for key in empty:
-        log(f"\n! {key}: keine verwertbaren Kandidaten — Kategorie wird NICHT überschrieben")
-        results.pop(key)
-
-    if DRY_RUN:
-        log("\n--- DRY RUN, es wird nichts geschrieben ---")
-        log(json.dumps({k: v["payload"] for k, v in results.items()}, indent=1, ensure_ascii=False))
-        return 0
-
-    if not results:
-        log("\nNichts zu schreiben.")
+    if not (ADMIN_ID and ADMIN_SECRET):
+        log("Admin-Zugangsdaten fehlen — Abbruch (Rotationsstand liegt im Custom Field).")
         return 1
 
     token = admin_token()
-    failed = []
-    for key, entry in results.items():
-        # Eine hakende Kategorie darf die anderen nicht mitreißen
-        try:
-            write_category(token, entry["categoryId"], entry["payload"])
-            log(f"\n{key}: geschrieben "
-                f"({len(entry['payload']['pairs'])} Paare, "
-                f"{len(entry['payload']['fallbackNeu'])}/{len(entry['payload']['fallbackUsed'])} Fallback)")
-        except Exception as exc:                      # noqa: BLE001
-            failed.append(key)
-            log(f"\n{key}: FEHLER beim Schreiben — {exc}")
+    previous = previous_payload(read_custom_fields(token, CONFIG_CATEGORY_ID))
+    used: List[str] = [] if RESET_ROTATION else list(previous.get("used") or [])
+    if RESET_ROTATION:
+        log("Rotationsstand wird zurückgesetzt (BPH_RESET_ROTATION=1).")
 
-    if failed:
-        log(f"\nNicht geschrieben: {', '.join(failed)} (alter Stand bleibt stehen)")
+    pool_ids = {c[0] for c in CATEGORY_POOL}
+    used = [c for c in used if c in pool_ids]          # entfernte Kategorien aufräumen
+    available = [c for c in CATEGORY_POOL if c[0] not in used]
+
+    tiles: List[dict] = []
+    picked: List[Tuple[str, str]] = []
+    draws = 0
+
+    while len(tiles) < TILE_COUNT and draws < MAX_DRAWS:
+        entry = pick_next(available, picked)
+        if entry is None:
+            break
+        draws += 1
+        category_id, label = entry
+        log(f"\n=== {label} ===")
+        started = time.time()
+
+        pairs = collect_pairs(category_id)
+        log(f"  {len(pairs)} gültige Paare")
+        for p in pairs:
+            log(f"    {p['name'][:40]} | Neu {p['neu']:.2f} -> "
+                f"{p['grade']} {p['used']:.2f} (-{p['save']}%)")
+
+        fb_new = collect_singles(category_id, OPTION_NEU, "Neu", None)
+        fb_used = collect_singles(category_id, OPTION_SEHR_GUT, "Sehr gut", "price-asc")
+        log(f"  Fallback: {len(fb_new)} neu / {len(fb_used)} gebraucht")
+        log(f"  {time.time() - started:.1f}s")
+
+        # Eine Kachel muss entweder ein Paar oder ein vollständiges
+        # Fallback-Duo tragen — sonst bliebe sie im Widget leer.
+        if not pairs and not (fb_new and fb_used):
+            log("  -> keine verwertbaren Kandidaten, nächste Kategorie")
+            continue
+
+        picked.append(entry)
+        tiles.append({
+            "categoryId": category_id,
+            "label": label,
+            "href": category_href(category_id),
+            "pairs": [p["parentId"] for p in pairs],
+            "fallbackNeu": [p["id"] for p in fb_new],
+            "fallbackUsed": [p["id"] for p in fb_used],
+        })
+
+    tiles = fill_up_from_previous(tiles, previous)
+
+    if not tiles:
+        log("\nKeine Kachel zustande gekommen — Custom Field bleibt unverändert.")
         return 1
+
+    payload = {
+        "updated": time.strftime("%Y-%m-%d"),
+        "tiles": tiles,
+        # Nur frisch gezogene Kategorien verbrauchen den Rotationsstand;
+        # übernommene Kacheln zählen nicht als „gezeigt".
+        "used": used + [c[0] for c in picked],
+    }
+
+    if DRY_RUN:
+        log("\n--- DRY RUN, es wird nichts geschrieben ---")
+        log(json.dumps(payload, indent=1, ensure_ascii=False))
+        return 0
+
+    serialized = json.dumps(payload, ensure_ascii=False)
+    try:
+        write_category(token, CONFIG_CATEGORY_ID, serialized)
+    except Exception as exc:                          # noqa: BLE001
+        log(f"\nFEHLER beim Schreiben — {exc} (alter Stand bleibt stehen)")
+        return 1
+
+    log("\ngeschrieben: " + ", ".join(
+        f"{t['label']} ({len(t['pairs'])} Paare)" for t in tiles))
+    log(f"Rotationsstand: {len(payload['used'])}/{len(CATEGORY_POOL)} Kategorien verbraucht")
     return 0
 
 
