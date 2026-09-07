@@ -117,7 +117,6 @@ CATEGORY_POOL: List[Tuple[str, str]] = [
     ("b310f92273f5f3d46600bf0336eeddef", "Kinderbücher"),
     ("513f6114563ce94e1417f4a60397ccb0", "Kochen & Genießen"),
     ("5c38a83946937ad372eb51c1bdf684d7", "Krimis & Thriller"),
-    ("8b4a15ca29c724ab3b80dac21d21a133", "LGBTQ+"),
     ("4652e4aa57836e42dbea13c404002941", "Liebesromane"),
     ("06cb4b87054afa0b3fc7b1817f81ed45", "Literatur & Fiktion"),
     ("1b1e265a25d71f126ea13e9f236d022d", "Medizin"),
