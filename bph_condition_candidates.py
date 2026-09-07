@@ -150,7 +150,7 @@ EXCLUDE_TITLE_WORDS = [
 
 MIN_SAVE_PCT = 30          # Mindestersparnis im Paar-Modus
 MIN_PRICE = 1.0            # Cent-Artikel raus
-PAIRS_PER_CATEGORY = 8     # so viele Paar-Kandidaten pro Kachel speichern
+PAIRS_PER_CATEGORY = 5     # so viele Paar-Kandidaten pro Kachel speichern
 FALLBACK_PER_SIDE = 5      # so viele Einzel-Exemplare je Seite speichern
 SCAN_PAGES = 3             # Listing-Seiten à 100, die durchsucht werden
 SIBLING_BATCH = 10         # parentIds pro Geschwister-Request
