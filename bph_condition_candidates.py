@@ -117,6 +117,7 @@ CATEGORY_POOL: List[Tuple[str, str]] = [
     ("b310f92273f5f3d46600bf0336eeddef", "Kinderbücher"),
     ("513f6114563ce94e1417f4a60397ccb0", "Kochen & Genießen"),
     ("5c38a83946937ad372eb51c1bdf684d7", "Krimis & Thriller"),
+    ("8b4a15ca29c724ab3b80dac21d21a133", "LGBTQ+"),
     ("4652e4aa57836e42dbea13c404002941", "Liebesromane"),
     ("06cb4b87054afa0b3fc7b1817f81ed45", "Literatur & Fiktion"),
     ("1b1e265a25d71f126ea13e9f236d022d", "Medizin"),
@@ -150,7 +151,7 @@ EXCLUDE_TITLE_WORDS = [
 
 MIN_SAVE_PCT = 30          # Mindestersparnis im Paar-Modus
 MIN_PRICE = 1.0            # Cent-Artikel raus
-PAIRS_PER_CATEGORY = 5     # so viele Paar-Kandidaten pro Kachel speichern
+PAIRS_PER_CATEGORY = 8     # so viele Paar-Kandidaten pro Kachel speichern
 FALLBACK_PER_SIDE = 5      # so viele Einzel-Exemplare je Seite speichern
 SCAN_PAGES = 3             # Listing-Seiten à 100, die durchsucht werden
 SIBLING_BATCH = 10         # parentIds pro Geschwister-Request
@@ -163,7 +164,8 @@ ADMIN_TIMEOUT = 120
 
 PRODUCT_INCLUDES = {
     "product": ["id", "parentId", "name", "translated", "cover",
-                "calculatedPrice", "options", "categoryIds", "customFields"],
+                "calculatedPrice", "options", "categoryIds", "customFields",
+                "available", "stock"],
     "property_group_option": ["name", "group"],
     "property_group": ["name"],
     "media": ["url", "metaData"],
@@ -266,9 +268,24 @@ def is_book(p: dict) -> bool:
     return bool((p.get("customFields") or {}).get("book_details_media_type"))
 
 
+def is_available(p: dict) -> bool:
+    """
+    Kaufbar heisst: Shopware-Flag `available` UND Bestand > 0.
+
+    ⚠ Der Endpunkt /store-api/product liefert auch VERKAUFTE Exemplare
+    (active, aber available=false, stock=0) — anders als das Listing,
+    das sie ausblendet. Am 10.09.2026 standen dadurch in allen drei
+    Kacheln gebrauchte Exemplare, die im Shop laengst weg waren.
+    Libri-Exemplare (LIB…) haben stock 10 und available=true, fallen
+    also nicht raus.
+    """
+    return bool(p.get("available")) and int(p.get("stock") or 0) > 0
+
+
 def usable(p: dict) -> bool:
     return (
-        product_price(p) >= MIN_PRICE
+        is_available(p)
+        and product_price(p) >= MIN_PRICE
         and condition(p) is not None
         and has_real_cover(p)
         and not is_excluded(p)
@@ -317,7 +334,11 @@ def fetch_siblings(parent_ids: List[str]) -> Dict[str, List[dict]]:
             {
                 "limit": 100,
                 "total-count-mode": 0,
-                "filter": [{"type": "equalsAny", "field": "parentId", "value": batch}],
+                "filter": [
+                    {"type": "equalsAny", "field": "parentId", "value": batch},
+                    # nur kaufbare Exemplare — /product liefert sonst auch verkaufte
+                    {"type": "equals", "field": "available", "value": True},
+                ],
                 "associations": {"options": {"associations": {"group": {}}}},
                 "includes": PRODUCT_INCLUDES,
             },
